@@ -1,0 +1,417 @@
+From 0023e2bb793d90525171f7e90fcc923a188f1ebf Mon Sep 17 00:00:00 2001
+From: diylxy <1452206376@qq.com>
+Date: Fri, 25 Apr 2025 13:36:23 +0800
+Subject: [PATCH] feat: Add support for texture framebuffer plugin
+
+---
+ CMakeLists.txt                      |   2 +
+ src/plugins/livision/livision.c     | 213 ++++++++++++++++++++++++++++
+ src/plugins/livision/livision.h     |   9 ++
+ src/plugins/livision/livision_shm.c | 100 +++++++++++++
+ src/plugins/livision/livision_shm.h |  38 +++++
+ 5 files changed, 362 insertions(+)
+ create mode 100644 src/plugins/livision/livision.c
+ create mode 100644 src/plugins/livision/livision.h
+ create mode 100644 src/plugins/livision/livision_shm.c
+ create mode 100644 src/plugins/livision/livision_shm.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 734aba5..95ba4d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -379,6 +379,8 @@ if (BUILD_CHARSET_CONVERTER_PLUGIN)
+   target_sources(flutterpi_module PRIVATE src/plugins/charset_converter.c)
+ endif()
+ 
++target_sources(flutterpi_module PRIVATE src/plugins/livision/livision.c src/plugins/livision/livision_shm.c)
++
+ # Sentry Plugin
+ set(HAVE_BUNDLED_CRASHPAD_HANDLER OFF)
+ if (BUILD_SENTRY_PLUGIN)
+diff --git a/src/plugins/livision/livision.c b/src/plugins/livision/livision.c
+new file mode 100644
+index 0000000..f4afdf1
+--- /dev/null
++++ b/src/plugins/livision/livision.c
+@@ -0,0 +1,213 @@
++#include "plugins/livision/livision.h"
++#include "plugins/livision/livision_shm.h"
++
++#include "flutter-pi.h"
++#include "pluginregistry.h"
++#include "util/logging.h"
++
++#include "gl_renderer.h"
++#include "texture_registry.h"
++
++
++static struct livision_internal {
++    bool initialized;
++    struct flutterpi* flutterpi;
++    EGLDisplay display;
++    EGLContext context;
++    struct texture* texture[FB_COUNT];
++    struct texture_frame frame;
++
++    // shm 相关
++    struct livision_ctl_t* controller;   // 共享内存控制器，包含信号量等
++    uint8_t* fb[4];                     // 存储mmap后的framebuffer
++
++    // 渲染线程
++    pthread_t thread;
++    bool stopRender;
++} internal;
++
++static bool create_egl_context()
++{
++    // create egl context
++    struct gl_renderer* renderer = flutterpi_get_gl_renderer(internal.flutterpi);
++
++    internal.display = gl_renderer_get_egl_display(renderer);
++    if (internal.display == EGL_NO_DISPLAY) {
++        return false;
++    }
++
++    internal.context = gl_renderer_create_context(renderer);
++    if (internal.context == EGL_NO_CONTEXT) {
++        return false;
++    }
++
++    return true;
++}
++
++static void destroy_egl_context()
++{
++    eglDestroyContext(internal.display, internal.context);
++}
++
++#define GL_RGBA8 0x8058
++#include <pthread.h>
++static void push_framebuffer(GLuint texture, int id)
++{
++    GLuint format;
++    struct livision_fb_header_t* header = &internal.controller->fbs[id];
++    if (header->bpp == 3) {
++        format = GL_RGB;
++    }
++    else {
++        format = GL_RGBA;
++    }
++    glBindTexture(GL_TEXTURE_2D, texture);
++
++    glTexImage2D(GL_TEXTURE_2D, 0, format, header->width, header->height,
++        0, GL_RGBA, GL_UNSIGNED_BYTE, internal.fb[id]);
++
++    // push the frame to flutter
++    internal.frame.gl.name = texture;
++    texture_push_frame(
++        internal.texture[id],
++        &internal.frame
++    );
++}
++
++void* thread_render(void*)
++{
++    bool first_loop = false;
++    GLuint textures[FB_COUNT];
++
++    if (!create_egl_context()) {
++        LOG_ERROR("Failed to create EGL context\n");
++        return NULL;
++    }
++    eglMakeCurrent(internal.display, EGL_NO_SURFACE, EGL_NO_SURFACE, internal.context);
++
++    glGenTextures(FB_COUNT, textures);
++
++    memset(&internal.frame, 0, sizeof(internal.frame));
++    internal.frame.gl.target = GL_TEXTURE_2D;
++    internal.frame.gl.format = GL_RGBA8;
++    // other fields are all zero
++
++    while (1) {
++        eglMakeCurrent(internal.display, EGL_NO_SURFACE, EGL_NO_SURFACE, internal.context);
++        for (int i = 0; i < FB_COUNT; ++i) {
++            if (internal.controller->fbs[i].frame_valid || first_loop) {
++                push_framebuffer(textures[i], i);
++                internal.controller->fbs[i].frame_valid = 0;
++            }
++        }
++        sem_post(&internal.controller->mutex);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        eglMakeCurrent(internal.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        while (1) {
++            bool has_new_frame = false;
++            sem_wait(&internal.controller->signal);
++            if (internal.stopRender) break;
++            sem_wait(&internal.controller->mutex);
++            for (int i = 0; i < FB_COUNT; ++i) {
++                if (internal.controller->fbs[i].frame_valid) {
++                    has_new_frame = true;
++                    break;
++                }
++            }
++            if (has_new_frame || internal.stopRender) break;
++            sem_post(&internal.controller->mutex);
++        }
++        if (internal.stopRender) break;
++        first_loop = true;
++    }
++    eglMakeCurrent(internal.display, EGL_NO_SURFACE, EGL_NO_SURFACE, internal.context);
++    glDeleteTextures(FB_COUNT, textures);
++    eglMakeCurrent(internal.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    destroy_egl_context();
++    return NULL;
++}
++
++static int on_get_texture(struct platch_obj* object, FlutterPlatformMessageResponseHandle* response_handle)
++{
++    (void)object;
++
++    if (internal.initialized == false) {
++        internal.controller = map_shm_ctl();
++        for (int i = 0; i < 4; ++i) {
++            internal.texture[i] = flutterpi_create_texture(internal.flutterpi);
++            internal.fb[i] = map_framebuffer(i);
++            if (internal.texture == NULL || internal.fb[i] == NULL) {
++                return platch_respond_error_std(response_handle, "gl-error", "Failed to initialize", &STDNULL);
++            }
++        }
++
++        internal.stopRender = false;
++        pthread_create(&internal.thread, NULL, thread_render, NULL);
++
++        internal.initialized = true;
++    }
++    int64_t textures[FB_COUNT];
++    for (int i = 0; i < FB_COUNT; ++i) {
++        textures[i] = texture_get_id(internal.texture[i]);
++    }
++    int ok = platch_respond_success_std(
++        response_handle,
++        &(struct std_value) {
++        .type = kStdInt64Array,
++            .size = FB_COUNT,
++            .int64array = (int64_t*)textures,
++    }
++    );
++
++    return ok;
++}
++
++static int on_receive(char* channel, struct platch_obj* object, FlutterPlatformMessageResponseHandle* response_handle)
++{
++    (void)channel;
++
++    const char* method;
++    method = object->method;
++
++    if (streq(method, "get_texture")) {
++        return on_get_texture(object, response_handle);
++    }
++
++    return platch_respond_not_implemented(response_handle);
++}
++
++enum plugin_init_result livision_init(struct flutterpi* flutterpi, void** userdata_out)
++{
++    int ok;
++
++    internal.flutterpi = flutterpi;
++
++    ok = plugin_registry_set_receiver_locked(LIVISION_CHANNEL, kStandardMethodCall, on_receive);
++    if (ok != 0) {
++        return PLUGIN_INIT_RESULT_ERROR;
++    }
++
++    *userdata_out = NULL;
++
++    return PLUGIN_INIT_RESULT_INITIALIZED;
++}
++
++void livision_deinit(struct flutterpi* flutterpi, void* userdata)
++{
++    (void)userdata;
++
++    plugin_registry_remove_receiver_v2_locked(flutterpi_get_plugin_registry(flutterpi), LIVISION_CHANNEL);
++
++    if (internal.initialized == false) return;
++    internal.stopRender = true;
++    sem_post(&internal.controller->signal);
++    pthread_join(internal.thread, NULL);
++    for (int i = 0; i < 4; ++i) {
++        unmap_framebuffer(internal.fb[i]);
++        internal.fb[i] = NULL;
++    }
++    unmap_shm_ctl(internal.controller);
++    internal.controller = NULL;
++}
++
++FLUTTERPI_PLUGIN("LiVision plugin", livision_plugin, livision_init, livision_deinit)
+diff --git a/src/plugins/livision/livision.h b/src/plugins/livision/livision.h
+new file mode 100644
+index 0000000..2ebe6b4
+--- /dev/null
++++ b/src/plugins/livision/livision.h
+@@ -0,0 +1,9 @@
++#ifndef _HELLO_PLUGIN_PLUGIN_H
++#define _HELLO_PLUGIN_PLUGIN_H
++
++#include <stdio.h>
++#include <string.h>
++
++#define LIVISION_CHANNEL "livision"
++
++#endif
+diff --git a/src/plugins/livision/livision_shm.c b/src/plugins/livision/livision_shm.c
+new file mode 100644
+index 0000000..379d6fd
+--- /dev/null
++++ b/src/plugins/livision/livision_shm.c
+@@ -0,0 +1,100 @@
++#include "livision_shm.h"
++
++#define SHM_FILE_CTL "/livision_ctl"
++#define SHM_SIZE_CTL sizeof(struct livision_ctl_t)
++#define SHM_FILE_FRAME "/livision_frame_%d"
++
++struct livision_ctl_t* map_shm_ctl(void)
++{
++    int fd = shm_open(SHM_FILE_CTL, O_CREAT | O_RDWR, 0666);
++    if (fd == -1) {
++        perror("open");
++        return NULL;
++    }
++
++    int success = ftruncate(fd, SHM_SIZE_CTL);
++    if (success != 0) {
++        perror("ftruncate");
++        return NULL;
++    }
++
++    struct livision_ctl_t* controller = mmap(NULL, SHM_SIZE_CTL, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (controller == MAP_FAILED) {
++        perror("mmap");
++        return NULL;
++    }
++    close(fd);
++    // 首次创建共享内存区域时，初始化信号量
++    if (controller->valid == 0) {
++        controller->valid = 1;
++        sem_init(&controller->signal, 1, 0);
++        sem_init(&controller->mutex, 1, 1);
++    }
++    return controller;
++}
++
++void unmap_shm_ctl(struct livision_ctl_t* controller)
++{
++    if (controller != NULL) {
++        // 关闭共享内存，但不删除
++        munmap(controller, SHM_SIZE_CTL);
++    }
++}
++
++static const char* get_framebuffer_name(int id)
++{
++    static char name[32];
++    snprintf(name, sizeof(name), SHM_FILE_FRAME, id);
++    return name;
++}
++
++/**
++ * @param controller 缓冲区控制器
++ * @param fb 分配请求，调用者需填写除data外的数据
++ * @return 0为成功，同时通过fb返回对应framebuffer地址，否则返回errno
++ */
++
++uint8_t* map_framebuffer(int id)
++{
++    if (id >= FB_COUNT) return NULL;
++
++    int fd = shm_open(get_framebuffer_name(id), O_CREAT | O_RDWR, 0666);
++    if (fd == -1) {
++        perror("open");
++        return NULL;
++    }
++
++    int success = ftruncate(fd, FB_MAX_LENGTH);
++    if (success != 0) {
++        perror("ftruncate");
++        return NULL;
++    }
++
++    uint8_t* data = mmap(NULL, FB_MAX_LENGTH, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (data == MAP_FAILED) {
++        perror("mmap");
++        return NULL;
++    }
++    close(fd);
++
++    return data;
++}
++
++
++void set_framebuffer_data(struct livision_ctl_t* controller, int id, int width, int height, int bpp, void* dst, const void* src)
++{
++    if (width * height * bpp > FB_MAX_LENGTH) return;
++    sem_wait(&controller->mutex);
++    memcpy(dst, src, width * height * bpp);
++    controller->fbs[id].bpp = bpp;
++    controller->fbs[id].width = width;
++    controller->fbs[id].height = height;
++    controller->fbs[id].frame_valid = 1;
++    sem_post(&controller->signal);
++    sem_post(&controller->mutex);
++}
++
++void unmap_framebuffer(uint8_t* fb)
++{
++    munmap(fb, FB_MAX_LENGTH);
++}
+diff --git a/src/plugins/livision/livision_shm.h b/src/plugins/livision/livision_shm.h
+new file mode 100644
+index 0000000..7fb5486
+--- /dev/null
++++ b/src/plugins/livision/livision_shm.h
+@@ -0,0 +1,38 @@
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <string.h>
++#include <semaphore.h>
++#include <errno.h>
++#include <stdint.h>
++
++#define FB_COUNT 4
++#define FB_MAX_LENGTH (2048 * 2048 * 4)         // framebuffer最大长度
++
++// 帧缓冲区信息
++struct livision_fb_header_t {
++    int width;              // 帧缓冲区宽度
++    int height;             // 帧缓冲区高度
++    int bpp;                // 每个像素的字节数，支持3（无GL_RGB）或4（GL_RGBA）
++    int frame_valid;        // 帧有效标志（由Flutter清零，C语言/Python客户端设置为1）
++};
++
++// 控制共享内存内容
++struct livision_ctl_t {
++    int valid;                                      // 共享内存是否有效，用于保证单次初始化
++    sem_t signal;                                   // 条件信号量，C语言/Python客户端在设置帧有效标志后释放，Flutter首先取得signal，
++                                                    // **循环检查**frame_valid是否为1，若是则加锁mutex，读取共享内存，否则继续尝试取得signal
++                                                    // （可能出现C客户端多次放置buffer但flutter未及时获取的情况）
++    sem_t mutex;                                    // 互斥信号量，当修改/读取共享内存时均需加锁
++    struct livision_fb_header_t fbs[FB_COUNT];      // 帧缓冲区头部信息
++};
++
++struct livision_ctl_t* map_shm_ctl(void);
++void unmap_shm_ctl(struct livision_ctl_t* controller);
++
++uint8_t* map_framebuffer(int id);
++void set_framebuffer_data(struct livision_ctl_t* controller, int id, int width, int height, int bpp, void* dst, const void* src);
++void unmap_framebuffer(uint8_t* fb);
+-- 
+2.34.1
+
