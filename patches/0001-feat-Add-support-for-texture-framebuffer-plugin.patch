@@ -1,15 +1,15 @@
-From 0023e2bb793d90525171f7e90fcc923a188f1ebf Mon Sep 17 00:00:00 2001
-From: diylxy <1452206376@qq.com>
-Date: Fri, 25 Apr 2025 13:36:23 +0800
+From 069917e08840d9064b1a8db4e14e07b3be3ddd80 Mon Sep 17 00:00:00 2001
+From: lxydiy <1452206376@qq.com>
+Date: Sun, 15 Jun 2025 16:35:47 +0800
 Subject: [PATCH] feat: Add support for texture framebuffer plugin
 
 ---
  CMakeLists.txt                      |   2 +
- src/plugins/livision/livision.c     | 213 ++++++++++++++++++++++++++++
+ src/plugins/livision/livision.c     | 215 ++++++++++++++++++++++++++++
  src/plugins/livision/livision.h     |   9 ++
  src/plugins/livision/livision_shm.c | 100 +++++++++++++
  src/plugins/livision/livision_shm.h |  38 +++++
- 5 files changed, 362 insertions(+)
+ 5 files changed, 364 insertions(+)
  create mode 100644 src/plugins/livision/livision.c
  create mode 100644 src/plugins/livision/livision.h
  create mode 100644 src/plugins/livision/livision_shm.c
@@ -30,10 +30,10 @@ index 734aba5..95ba4d5 100644
  if (BUILD_SENTRY_PLUGIN)
 diff --git a/src/plugins/livision/livision.c b/src/plugins/livision/livision.c
 new file mode 100644
-index 0000000..f4afdf1
+index 0000000..9750fca
 --- /dev/null
 +++ b/src/plugins/livision/livision.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,215 @@
 +#include "plugins/livision/livision.h"
 +#include "plugins/livision/livision_shm.h"
 +
@@ -110,10 +110,12 @@ index 0000000..f4afdf1
 +    );
 +}
 +
-+void* thread_render(void*)
++void* thread_render(void* args)
 +{
 +    bool first_loop = false;
 +    GLuint textures[FB_COUNT];
++
++    (void)args;
 +
 +    if (!create_egl_context()) {
 +        LOG_ERROR("Failed to create EGL context\n");
@@ -172,7 +174,7 @@ index 0000000..f4afdf1
 +        for (int i = 0; i < 4; ++i) {
 +            internal.texture[i] = flutterpi_create_texture(internal.flutterpi);
 +            internal.fb[i] = map_framebuffer(i);
-+            if (internal.texture == NULL || internal.fb[i] == NULL) {
++            if (internal.texture[i] == NULL || internal.fb[i] == NULL) {
 +                return platch_respond_error_std(response_handle, "gl-error", "Failed to initialize", &STDNULL);
 +            }
 +        }
