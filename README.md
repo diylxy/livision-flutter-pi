@@ -22,5 +22,5 @@ sudo ./install_fonts.sh
 ```
 ### 编译并安装
 ```bash
-sudo build.sh install
+sudo ./build.sh install
 ```
